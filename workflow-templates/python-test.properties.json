@@ -1,0 +1,6 @@
+{
+  "name": "Python Tests",
+  "description": "Run pytest on push/PR to main",
+  "iconName": "python",
+  "categories": ["Python"]
+}

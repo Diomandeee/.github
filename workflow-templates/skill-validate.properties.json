@@ -1,0 +1,6 @@
+{
+  "name": "Skill Validate",
+  "description": "Validate Clawdbot skill manifests",
+  "iconName": "gear",
+  "categories": ["Agents"]
+}

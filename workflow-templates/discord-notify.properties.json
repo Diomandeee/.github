@@ -1,0 +1,6 @@
+{
+  "name": "Discord Notify",
+  "description": "Post workflow status to Discord via webhook",
+  "iconName": "chat",
+  "categories": ["Notifications"]
+}

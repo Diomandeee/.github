@@ -1,0 +1,6 @@
+{
+  "name": "iOS Build",
+  "description": "Build Xcode project on macOS runner",
+  "iconName": "apple",
+  "categories": ["Swift", "iOS"]
+}

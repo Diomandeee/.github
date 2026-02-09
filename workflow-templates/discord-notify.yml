@@ -1,0 +1,39 @@
+name: Discord Notify
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        required: true
+        type: string
+      message:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      webhook_url:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.webhook_url }}
+          STATUS: ${{ inputs.status }}
+          MESSAGE: ${{ inputs.message }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          EMOJI="✅"
+          [[ "$STATUS" != "success" ]] && EMOJI="❌"
+
+          BODY="$EMOJI **${REPO}** — ${STATUS}"
+          [ -n "$MESSAGE" ] && BODY="$BODY\n$MESSAGE"
+          BODY="$BODY\nCommit: \`${SHA:0:7}\` by ${ACTOR}"
+
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"content\": \"$BODY\"}" \
+            "$WEBHOOK_URL"

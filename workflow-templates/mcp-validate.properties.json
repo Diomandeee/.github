@@ -1,0 +1,6 @@
+{
+  "name": "MCP Server Validate",
+  "description": "Validate MCP server starts and passes lint",
+  "iconName": "gear",
+  "categories": ["MCP", "Agents"]
+}

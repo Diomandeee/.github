@@ -1,0 +1,6 @@
+{
+  "name": "Expo Build",
+  "description": "Typecheck and lint Expo/React Native project",
+  "iconName": "react",
+  "categories": ["JavaScript", "TypeScript", "React Native"]
+}

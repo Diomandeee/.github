@@ -1,0 +1,38 @@
+name: Skill Validate
+
+on:
+  push:
+    branches: [main]
+    paths: ['skills/**', 'clawdbot/skills/**']
+  pull_request:
+    paths: ['skills/**', 'clawdbot/skills/**']
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check skill manifests
+        run: |
+          ERRORS=0
+          for skill_dir in $(find . -name "SKILL.md" -exec dirname {} \;); do
+            skill_name=$(basename "$skill_dir")
+            echo "Checking: $skill_name"
+
+            # Check SKILL.md exists and has content
+            if [ ! -s "$skill_dir/SKILL.md" ]; then
+              echo "  ✗ SKILL.md is empty"
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "  ✓ SKILL.md present"
+            fi
+          done
+
+          echo ""
+          if [ $ERRORS -gt 0 ]; then
+            echo "$ERRORS error(s) found"
+            exit 1
+          else
+            echo "All skills valid"
+          fi

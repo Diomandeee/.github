@@ -1,0 +1,6 @@
+{
+  "name": "Node.js Tests",
+  "description": "Run npm test on push/PR to main",
+  "iconName": "nodejs",
+  "categories": ["JavaScript", "TypeScript"]
+}

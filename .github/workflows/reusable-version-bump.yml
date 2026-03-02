@@ -1,0 +1,106 @@
+# OpenClaw Reusable Version Bump
+# Usage: reference from any iOS repo's .github/workflows/version-bump.yml
+#   jobs:
+#     bump:
+#       uses: Diomandeee/.github/.github/workflows/reusable-version-bump.yml@main
+#       with:
+#         bump-type: patch
+
+name: Reusable Version Bump
+
+on:
+  workflow_call:
+    inputs:
+      bump-type:
+        description: 'Version bump type (major, minor, patch)'
+        required: false
+        type: string
+        default: 'patch'
+      tag-prefix:
+        description: 'Tag prefix (e.g., "v", "release-")'
+        required: false
+        type: string
+        default: 'v'
+      project-path:
+        description: 'Subdirectory containing project.yml'
+        required: false
+        type: string
+        default: '.'
+
+jobs:
+  bump:
+    name: Bump Version & Tag
+    runs-on: macos-14
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Get current version
+        id: current
+        working-directory: ${{ inputs.project-path }}
+        run: |
+          if [ -f project.yml ]; then
+            VERSION=$(grep 'MARKETING_VERSION:' project.yml | head -1 | sed 's/.*: *"\{0,1\}\([0-9.]*\)"\{0,1\}/\1/')
+          elif ls *.xcodeproj 1>/dev/null 2>&1; then
+            VERSION=$(grep 'MARKETING_VERSION' *.xcodeproj/project.pbxproj | head -1 | sed 's/.*= *\([0-9.]*\).*/\1/')
+          else
+            VERSION="1.0.0"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
+
+      - name: Bump version
+        id: bumped
+        run: |
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${{ steps.current.outputs.version }}"
+          case "${{ inputs.bump-type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+      - name: Update project.yml
+        working-directory: ${{ inputs.project-path }}
+        run: |
+          if [ -f project.yml ]; then
+            sed -i '' "s/MARKETING_VERSION:.*/MARKETING_VERSION: \"${{ steps.bumped.outputs.version }}\"/" project.yml
+            echo "Updated project.yml"
+          fi
+
+      - name: Regenerate Xcode project
+        working-directory: ${{ inputs.project-path }}
+        run: |
+          if [ -f project.yml ]; then
+            brew install xcodegen 2>/dev/null || true
+            xcodegen generate
+          fi
+
+      - name: Commit & Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: bump version to ${{ steps.bumped.outputs.version }}" || echo "No changes to commit"
+          git tag "${{ inputs.tag-prefix }}${{ steps.bumped.outputs.version }}"
+          git push origin HEAD --tags
+
+      - name: Summary
+        run: |
+          echo "## Version Bumped" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Previous** | ${{ steps.current.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **New** | ${{ steps.bumped.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tag** | ${{ inputs.tag-prefix }}${{ steps.bumped.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Type** | ${{ inputs.bump-type }} |" >> $GITHUB_STEP_SUMMARY

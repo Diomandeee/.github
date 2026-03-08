@@ -1,10 +1,18 @@
 # OpenClaw Reusable Version Bump
-# Usage: reference from any iOS repo's .github/workflows/version-bump.yml
+#
+# Bumps MARKETING_VERSION in project.yml, commits, tags, and pushes.
+# Runs on ubuntu-latest (no Xcode needed). The .xcodeproj is regenerated
+# by the CI/TestFlight workflow at build time.
+#
+# Usage:
 #   jobs:
 #     bump:
 #       uses: Diomandeee/.github/.github/workflows/reusable-version-bump.yml@main
 #       with:
 #         bump-type: patch
+#
+# Note: Pushes use GITHUB_TOKEN which will NOT trigger downstream workflows.
+# To trigger downstream CI on the bump commit, pass a PAT via secrets.GH_PAT.
 
 name: Reusable Version Bump
 
@@ -26,81 +34,138 @@ on:
         required: false
         type: string
         default: '.'
+    outputs:
+      version:
+        description: 'The new version number'
+        value: ${{ jobs.bump.outputs.version }}
+    secrets:
+      GH_PAT:
+        description: 'Optional PAT to trigger downstream workflows on push'
+        required: false
+
+concurrency:
+  group: version-bump-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   bump:
     name: Bump Version & Tag
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.bumped.outputs.version }}
 
     steps:
+      - name: Validate inputs
+        env:
+          BUMP_TYPE: ${{ inputs.bump-type }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PROJECT_PATH: ${{ inputs.project-path }}
+        run: |
+          # Validate bump-type
+          if ! [[ "$BUMP_TYPE" =~ ^(major|minor|patch)$ ]]; then
+            echo "::error::bump-type must be major, minor, or patch. Got: $BUMP_TYPE"
+            exit 1
+          fi
+          # Validate tag-prefix
+          if ! [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9/._-]*$ ]]; then
+            echo "::error::tag-prefix contains invalid characters: $TAG_PREFIX"
+            exit 1
+          fi
+          # Validate project-path
+          if [[ "$PROJECT_PATH" == *".."* || "$PROJECT_PATH" == /* ]]; then
+            echo "::error::project-path must be relative without '..'"
+            exit 1
+          fi
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-          token: ${{ github.token }}
+          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Get current version
         id: current
         working-directory: ${{ inputs.project-path }}
         run: |
           if [ -f project.yml ]; then
-            VERSION=$(grep 'MARKETING_VERSION:' project.yml | head -1 | sed 's/.*: *"\{0,1\}\([0-9.]*\)"\{0,1\}/\1/')
+            VERSION=$(grep -Eo 'MARKETING_VERSION: *"?[0-9]+\.[0-9]+(\.[0-9]+)?"?' project.yml \
+              | head -1 | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?')
           elif ls *.xcodeproj 1>/dev/null 2>&1; then
             VERSION=$(grep 'MARKETING_VERSION' *.xcodeproj/project.pbxproj | head -1 | sed 's/.*= *\([0-9.]*\).*/\1/')
-          else
-            VERSION="1.0.0"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract MARKETING_VERSION from project.yml or .xcodeproj"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Current version: $VERSION"
 
       - name: Bump version
         id: bumped
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          BUMP_TYPE: ${{ inputs.bump-type }}
         run: |
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${{ steps.current.outputs.version }}"
-          case "${{ inputs.bump-type }}" in
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          case "$BUMP_TYPE" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
           esac
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "New version: $NEW_VERSION"
 
       - name: Update project.yml
         working-directory: ${{ inputs.project-path }}
+        env:
+          NEW_VERSION: ${{ steps.bumped.outputs.version }}
         run: |
           if [ -f project.yml ]; then
-            sed -i '' "s/MARKETING_VERSION:.*/MARKETING_VERSION: \"${{ steps.bumped.outputs.version }}\"/" project.yml
-            echo "Updated project.yml"
-          fi
-
-      - name: Regenerate Xcode project
-        working-directory: ${{ inputs.project-path }}
-        run: |
-          if [ -f project.yml ]; then
-            brew install xcodegen 2>/dev/null || true
-            xcodegen generate
+            sed -i "s/MARKETING_VERSION:.*/MARKETING_VERSION: \"$NEW_VERSION\"/" project.yml
+            echo "Updated project.yml to $NEW_VERSION"
           fi
 
       - name: Commit & Tag
+        env:
+          NEW_VERSION: ${{ steps.bumped.outputs.version }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          PROJECT_PATH: ${{ inputs.project-path }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore: bump version to ${{ steps.bumped.outputs.version }}" || echo "No changes to commit"
-          git tag "${{ inputs.tag-prefix }}${{ steps.bumped.outputs.version }}"
+
+          # Stage only the files we modified
+          git add "$PROJECT_PATH/project.yml" 2>/dev/null || true
+          git add "$PROJECT_PATH"/*.xcodeproj/project.pbxproj 2>/dev/null || true
+
+          git commit -m "chore: bump version to ${NEW_VERSION}" || echo "No changes to commit"
+
+          TAG="${TAG_PREFIX}${NEW_VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Tag $TAG already exists, skipping"
+          else
+            git tag "$TAG"
+          fi
           git push origin HEAD --tags
 
       - name: Summary
+        env:
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+          NEW_VERSION: ${{ steps.bumped.outputs.version }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          BUMP_TYPE: ${{ inputs.bump-type }}
         run: |
-          echo "## Version Bumped" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| | |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Previous** | ${{ steps.current.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **New** | ${{ steps.bumped.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tag** | ${{ inputs.tag-prefix }}${{ steps.bumped.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Type** | ${{ inputs.bump-type }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Version Bumped"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Previous** | ${OLD_VERSION} |"
+            echo "| **New** | ${NEW_VERSION} |"
+            echo "| **Tag** | ${TAG_PREFIX}${NEW_VERSION} |"
+            echo "| **Type** | ${BUMP_TYPE} |"
+          } >> "$GITHUB_STEP_SUMMARY"

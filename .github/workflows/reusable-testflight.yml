@@ -1,5 +1,9 @@
 # OpenClaw Reusable TestFlight Upload
-# Usage: reference from any iOS repo's .github/workflows/testflight.yml
+#
+# Archives an iOS app, exports the IPA, and uploads to TestFlight via ASC API.
+# Optionally logs delivery metadata to Supabase.
+#
+# Usage:
 #   jobs:
 #     upload:
 #       uses: Diomandeee/.github/.github/workflows/reusable-testflight.yml@main
@@ -7,6 +11,18 @@
 #         scheme: MyApp
 #         bundle-id: com.openclaw.myapp
 #       secrets: inherit
+#
+# Required secrets:
+#   BUILD_CERTIFICATE_BASE64   .p12 distribution cert, base64-encoded
+#   P12_PASSWORD               Password used when exporting .p12
+#   KEYCHAIN_PASSWORD          Any strong random string
+#   ASC_KEY_BASE64             .p8 API key from ASC, base64-encoded
+#   ASC_KEY_ID                 Key ID from ASC > Users & Access > Keys
+#   ASC_ISSUER_ID              Issuer ID from the same ASC page
+#
+# Optional secrets:
+#   SUPABASE_URL               Supabase project URL (for delivery logging)
+#   SUPABASE_KEY               Supabase anon/service key
 
 name: Reusable TestFlight Upload
 
@@ -32,7 +48,7 @@ on:
         type: string
         default: '16.2'
       build-number-override:
-        description: 'Manual build number override'
+        description: 'Manual build number override (must be a positive integer)'
         required: false
         type: string
         default: ''
@@ -42,7 +58,7 @@ on:
         type: string
         default: 'ExportOptions.plist'
       project-flag:
-        description: 'Use -project or -workspace flag'
+        description: 'Use -project or -workspace flag (e.g. "-workspace MyApp.xcworkspace")'
         required: false
         type: string
         default: ''
@@ -51,6 +67,20 @@ on:
         required: false
         type: boolean
         default: false
+      runner:
+        description: 'GitHub runner image'
+        required: false
+        type: string
+        default: 'macos-14'
+      team-id:
+        description: 'Apple Developer Team ID'
+        required: false
+        type: string
+        default: '8643C988C4'
+    outputs:
+      build-number:
+        description: 'The build number used for this upload'
+        value: ${{ jobs.build-and-upload.outputs.build_number }}
     secrets:
       BUILD_CERTIFICATE_BASE64:
         required: true
@@ -69,39 +99,69 @@ on:
       SUPABASE_KEY:
         required: false
 
-env:
-  TEAM_ID: 8643C988C4
+concurrency:
+  group: testflight-${{ github.repository }}-${{ inputs.scheme }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-upload:
     name: Archive & Upload to TestFlight
-    runs-on: macos-14
-    timeout-minutes: 45
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    outputs:
+      build_number: ${{ steps.build_number.outputs.number }}
 
     steps:
+      - name: Validate inputs
+        env:
+          PROJECT_PATH: ${{ inputs.project-path }}
+          EXPORT_PATH: ${{ inputs.export-options-path }}
+          BUILD_OVERRIDE: ${{ inputs.build-number-override }}
+          PROJECT_FLAG: ${{ inputs.project-flag }}
+        run: |
+          # Reject path traversal
+          for p in "$PROJECT_PATH" "$EXPORT_PATH"; do
+            if [[ "$p" == *".."* || "$p" == /* ]]; then
+              echo "::error::Paths must be relative without '..': $p"
+              exit 1
+            fi
+          done
+          # Validate build number override is numeric
+          if [ -n "$BUILD_OVERRIDE" ] && ! [[ "$BUILD_OVERRIDE" =~ ^[0-9]+$ ]]; then
+            echo "::error::build-number-override must be a positive integer, got: $BUILD_OVERRIDE"
+            exit 1
+          fi
+          # Validate project-flag format
+          if [ -n "$PROJECT_FLAG" ] && ! [[ "$PROJECT_FLAG" =~ ^-(project|workspace)[[:space:]]+[A-Za-z0-9._/-]+(\.(xcodeproj|xcworkspace))?$ ]]; then
+            echo "::warning::project-flag '$PROJECT_FLAG' does not match expected pattern (-project/-workspace <name>)"
+          fi
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd  # v1
         with:
           xcode-version: ${{ inputs.xcode-version }}
 
       - name: Cache SPM
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: |
+            .build
             ~/Library/Caches/org.swift.swiftpm
             ${{ inputs.project-path }}/SourcePackages
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved', '**/Package.swift') }}
+          key: ${{ runner.os }}-${{ github.repository }}-spm-${{ inputs.xcode-version }}-${{ hashFiles('**/Package.resolved', '**/Package.swift') }}
           restore-keys: |
-            ${{ runner.os }}-spm-
+            ${{ runner.os }}-${{ github.repository }}-spm-${{ inputs.xcode-version }}-
 
       - name: Generate project (xcodegen)
         working-directory: ${{ inputs.project-path }}
         run: |
-          if [ -f project.yml ]; then
-            brew install xcodegen 2>/dev/null || true
+          if [ -f project.yml ] && ! ls *.xcodeproj 1>/dev/null 2>&1; then
+            if ! command -v xcodegen &>/dev/null; then
+              brew install xcodegen
+            fi
             xcodegen generate
           fi
 
@@ -111,110 +171,171 @@ jobs:
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing-${GITHUB_RUN_ID}.keychain-db"
 
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Store path for cleanup
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Install App Store Connect API Key
+        id: asc_key
         env:
           ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         run: |
-          mkdir -p ~/private_keys
-          echo -n "$ASC_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          KEYS_DIR="$RUNNER_TEMP/private_keys_${GITHUB_RUN_ID}"
+          mkdir -p "$KEYS_DIR"
+          echo -n "$ASC_KEY_BASE64" | base64 --decode -o "$KEYS_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          echo "keys_dir=$KEYS_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Determine Build Number
         id: build_number
+        env:
+          BUILD_OVERRIDE: ${{ inputs.build-number-override }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          if [ -n "${{ inputs.build-number-override }}" ]; then
-            echo "number=${{ inputs.build-number-override }}" >> $GITHUB_OUTPUT
+          if [ -n "$BUILD_OVERRIDE" ]; then
+            echo "number=$BUILD_OVERRIDE" >> "$GITHUB_OUTPUT"
           else
-            echo "number=${{ github.run_number }}" >> $GITHUB_OUTPUT
+            echo "number=$RUN_NUMBER" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Archive
         working-directory: ${{ inputs.project-path }}
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          PROJECT_FLAG: ${{ inputs.project-flag }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          BUILD_NUMBER: ${{ steps.build_number.outputs.number }}
+          KEYS_DIR: ${{ steps.asc_key.outputs.keys_dir }}
+          TEAM_ID: ${{ inputs.team-id }}
         run: |
+          set -o pipefail
           EXTRA_FLAGS=""
-          if [ -n "${{ inputs.project-flag }}" ]; then
-            EXTRA_FLAGS="${{ inputs.project-flag }}"
+          if [ -n "$PROJECT_FLAG" ]; then
+            EXTRA_FLAGS="$PROJECT_FLAG"
           fi
 
           xcodebuild archive \
-            -scheme "${{ inputs.scheme }}" \
+            -scheme "$SCHEME" \
             $EXTRA_FLAGS \
-            -archivePath $RUNNER_TEMP/${{ inputs.scheme }}.xcarchive \
+            -archivePath "$RUNNER_TEMP/${SCHEME}-${GITHUB_RUN_ID}.xcarchive" \
             -destination 'generic/platform=iOS' \
             -allowProvisioningUpdates \
-            -authenticationKeyPath ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8 \
-            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
-            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }} \
+            -authenticationKeyPath "$KEYS_DIR/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CURRENT_PROJECT_VERSION=${{ steps.build_number.outputs.number }} \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGN_STYLE=Automatic \
-            DEVELOPMENT_TEAM=$TEAM_ID
+            DEVELOPMENT_TEAM="$TEAM_ID"
 
       - name: Export
         working-directory: ${{ inputs.project-path }}
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          EXPORT_OPTIONS: ${{ inputs.export-options-path }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEYS_DIR: ${{ steps.asc_key.outputs.keys_dir }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/${{ inputs.scheme }}.xcarchive \
-            -exportPath $RUNNER_TEMP/export \
-            -exportOptionsPlist ${{ inputs.export-options-path }} \
+            -archivePath "$RUNNER_TEMP/${SCHEME}-${GITHUB_RUN_ID}.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
             -allowProvisioningUpdates \
-            -authenticationKeyPath ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8 \
-            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
-            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+            -authenticationKeyPath "$KEYS_DIR/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
 
       - name: Upload to TestFlight
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcrun altool --upload-app \
             --type ios \
-            --file "$RUNNER_TEMP/export/${{ inputs.scheme }}.ipa" \
-            --apiKey ${{ secrets.ASC_KEY_ID }} \
-            --apiIssuer ${{ secrets.ASC_ISSUER_ID }} \
-            2>&1 || true
+            --file "$RUNNER_TEMP/export/${SCHEME}.ipa" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
 
       - name: Log delivery to Supabase
-        if: inputs.supabase-log && secrets.SUPABASE_URL != ''
+        if: inputs.supabase-log && (success() || failure())
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SCHEME: ${{ inputs.scheme }}
+          BUNDLE_ID: ${{ inputs.bundle-id }}
+          BUILD_NUMBER: ${{ steps.build_number.outputs.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          curl -s -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/testflight_deliveries" \
-            -H "apikey: ${{ secrets.SUPABASE_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"app_name\": \"${{ inputs.scheme }}\",
-              \"bundle_id\": \"${{ inputs.bundle-id }}\",
-              \"build_number\": \"${{ steps.build_number.outputs.number }}\",
-              \"trigger\": \"${{ github.event_name }}\",
-              \"ref\": \"${{ github.ref }}\",
-              \"status\": \"uploaded\",
-              \"github_run_id\": \"${{ github.run_id }}\"
-            }" || true
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "::warning::supabase-log=true but SUPABASE_URL secret is not set"
+            exit 0
+          fi
+          python3 -c "
+          import json, os, urllib.request
+          payload = json.dumps({
+              'app_name': os.environ['SCHEME'],
+              'bundle_id': os.environ['BUNDLE_ID'],
+              'build_number': os.environ['BUILD_NUMBER'],
+              'trigger': os.environ['EVENT_NAME'],
+              'ref': os.environ['GIT_REF'],
+              'status': os.environ['JOB_STATUS'],
+              'github_run_id': os.environ['RUN_ID'],
+          }).encode()
+          req = urllib.request.Request(
+              os.environ['SUPABASE_URL'] + '/rest/v1/testflight_deliveries',
+              data=payload,
+              headers={
+                  'apikey': os.environ['SUPABASE_KEY'],
+                  'Authorization': 'Bearer ' + os.environ['SUPABASE_KEY'],
+                  'Content-Type': 'application/json',
+              },
+              method='POST')
+          urllib.request.urlopen(req)
+          " || echo "::warning::Supabase logging failed (non-fatal)"
 
-      - name: Clean up keychain
+      - name: Clean up secrets
         if: always()
         run: |
-          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys_${GITHUB_RUN_ID}" 2>/dev/null || true
 
       - name: Summary
+        if: always()
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          BUNDLE: ${{ inputs.bundle-id }}
+          BUILD: ${{ steps.build_number.outputs.number }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
-          echo "## TestFlight Upload Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **App** | ${{ inputs.scheme }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Bundle** | ${{ inputs.bundle-id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Build** | ${{ steps.build_number.outputs.number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Trigger** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Ref** | ${{ github.ref }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## TestFlight Upload"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **App** | ${SCHEME} |"
+            echo "| **Bundle** | ${BUNDLE} |"
+            echo "| **Build** | ${BUILD} |"
+            echo "| **Trigger** | ${EVENT} |"
+            echo "| **Ref** | ${REF} |"
+            echo "| **Status** | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
